@@ -95,21 +95,35 @@ def inside(container, script):
     return command(["docker", "exec", container, "sh", "-ec", script])
 
 
-def http_code(container, path, auth):
-    creds = '-u "$USERNAME:$PASSWORD" ' if auth else ""
-    return inside(container, "curl -s -o /dev/null -w '%{http_code}' " + creds + "http://127.0.0.1:8384" + path)
+API = 'curl -fsS -H "X-API-Key: $(sed -n \'s:.*<apikey>\\(.*\\)</apikey>.*:\\1:p\' /var/syncthing/config/config.xml)" '
+
+
+def api(container, path, options=""):
+    # Syncthing REST calls need the API key (or a CSRF token); the key stays inside the container.
+    return inside(container, API + options + " http://127.0.0.1:8384" + path).replace(" ", "")
+
+
+def login_code(container, suffix):
+    # suffix "" sends the configured password; anything else sends a wrong one.
+    body = '{"username":"\'"$USERNAME"\'","password":"\'"$PASSWORD' + suffix + '"\'"}'
+    return inside(container, "curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' "
+                             "-d '" + body + "' http://127.0.0.1:8384/rest/noauth/auth/password")
 
 
 def check_app(container, instance):
-    assert http_code(container, "/rest/system/version", False) in ("401", "403"), "GUI accepted an unauthenticated request"
-    version = inside(container, 'curl -fsS -u "$USERNAME:$PASSWORD" http://127.0.0.1:8384/rest/system/version')
-    assert '"version":"' + EXPECTED_VERSION + '"' in version.replace(" ", ""), "Unexpected running version"
+    assert login_code(container, "") == "204", "GUI login with the configured password failed"
+    assert login_code(container, "-wrong") == "403", "GUI accepted a wrong password"
+    assert '"version":"' + EXPECTED_VERSION + '"' in api(container, "/rest/system/version"), "Unexpected running version"
     config = inside(container, "cat /var/syncthing/config/config.xml")
+    assert "<user>" + USER + "</user>" in config, "GUI user not set"
+    assert re.search(r"<password>\$2[aby]\$", config), "GUI password not stored as a bcrypt hash"
     assert "<listenAddress>tcp://0.0.0.0:22000</listenAddress>" in config, "Listen address not applied"
     assert "<localAnnouncePort>21027</localAnnouncePort>" in config, "Local announce port not applied"
     assert "<maxFolderConcurrency>2</maxFolderConcurrency>" in config, "Folder concurrency limit missing"
     assert "<maxConcurrentWrites>4</maxConcurrentWrites>" in config, "Concurrent write limit missing"
     assert inside(container, "stat -c %u:%g /var/syncthing/config/config.xml") == "1000:1000", "Config not owned by UID 1000"
+    logs = subprocess.run(["docker", "logs", container], capture_output=True, text=True, timeout=30)
+    assert password not in logs.stdout + logs.stderr, "Password written to container log"
     callbacks = command(["docker", "exec", RUN + "-callback", "cat", "/tmp/callbacks"])
     assert "/v1/apps/installed/" + instance in callbacks.splitlines(), "Install callback not received"
 
@@ -160,12 +174,11 @@ command(["docker", "run", "-d", "--name", old, "--label", LABEL, "--network", ne
          "-e", "USERNAME=" + USER, "-e", "PASSWORD", "-v", storage + ":/var/syncthing", "--entrypoint", "/bin/syncthing", PREVIOUS],
         env={**os.environ, "PASSWORD": password})
 wait_healthy(old)
-inside(old, "mkdir -p /var/syncthing/gate-data && echo appbox > /var/syncthing/gate-data/file.txt && "
-            'curl -fsS -u "$USERNAME:$PASSWORD" -H "Content-Type: application/json" -X POST '
-            "-d '{\"id\":\"gate-folder\",\"label\":\"Gate\",\"path\":\"/var/syncthing/gate-data\"}' "
-            "http://127.0.0.1:8384/rest/config/folders >/dev/null")
+inside(old, "mkdir -p /var/syncthing/gate-data && echo appbox > /var/syncthing/gate-data/file.txt")
+api(old, "/rest/config/folders", "-H 'Content-Type: application/json' -X POST "
+    "-d '{\"id\":\"gate-folder\",\"label\":\"Gate\",\"path\":\"/var/syncthing/gate-data\"}'")
 deadline = time.monotonic() + 120
-while '"localFiles":1' not in inside(old, 'curl -fsS -u "$USERNAME:$PASSWORD" "http://127.0.0.1:8384/rest/db/status?folder=gate-folder"').replace(" ", ""):
+while '"localFiles":1' not in api(old, "/rest/db/status?folder=gate-folder"):
     assert time.monotonic() < deadline, "Baseline image did not scan the test folder"
     time.sleep(2)
 command(["docker", "stop", old])
@@ -174,10 +187,9 @@ print("PASS baseline: current catalogue image created config, database and folde
 upgraded = RUN + "-upgraded"
 run_app(upgraded, storage, "9002")
 check_app(upgraded, "9002")
-folders = inside(upgraded, 'curl -fsS -u "$USERNAME:$PASSWORD" http://127.0.0.1:8384/rest/config/folders')
-assert '"id":"gate-folder"' in folders.replace(" ", ""), "Upgrade lost the folder configuration"
+assert '"id":"gate-folder"' in api(upgraded, "/rest/config/folders"), "Upgrade lost the folder configuration"
 deadline = time.monotonic() + 120
-while '"localFiles":1' not in inside(upgraded, 'curl -fsS -u "$USERNAME:$PASSWORD" "http://127.0.0.1:8384/rest/db/status?folder=gate-folder"').replace(" ", ""):
+while '"localFiles":1' not in api(upgraded, "/rest/db/status?folder=gate-folder"):
     assert time.monotonic() < deadline, "Upgraded image did not report the existing folder contents"
     time.sleep(2)
 print("PASS upgrade: login, folder and database carried over from the catalogue image", flush=True)
