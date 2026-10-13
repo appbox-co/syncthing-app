@@ -10,15 +10,17 @@ ARG GOVERSION=latest
 FROM golang:$GOVERSION AS builder
 ARG BUILD_USER
 ARG BUILD_HOST
-ARG TARGETARCH
+ARG TARGETARCH=amd64
+# Build contexts come from git archive (no .git), so pin the release version.
+ARG VERSION=v2.1.6
 
 WORKDIR /src
 COPY . .
 
 ENV CGO_ENABLED=0
-RUN if [ ! -f syncthing-linux-$TARGETARCH ] ; then \
-    go run build.go -no-upgrade build syncthing ; \
-    mv syncthing syncthing-linux-$TARGETARCH ; \
+RUN if [ ! -f syncthing-linux-amd64 ] ; then \
+    VERSION=$VERSION go run build.go -no-upgrade build syncthing ; \
+    mv syncthing syncthing-linux-amd64 ; \
   fi
 
 #
@@ -27,24 +29,13 @@ RUN if [ ! -f syncthing-linux-$TARGETARCH ] ; then \
 #
 
 FROM alpine
-ARG TARGETARCH
 
-LABEL org.opencontainers.image.authors="The Syncthing Project" \
-      org.opencontainers.image.url="https://syncthing.net" \
-      org.opencontainers.image.documentation="https://docs.syncthing.net" \
-      org.opencontainers.image.source="https://github.com/syncthing/syncthing" \
-      org.opencontainers.image.vendor="The Syncthing Project" \
-      org.opencontainers.image.licenses="MPL-2.0" \
-      org.opencontainers.image.title="Syncthing"
+EXPOSE 8384
 
-EXPOSE 8384 22000/tcp 22000/udp 21027/udp
+RUN apk add --no-cache ca-certificates curl libcap su-exec tzdata bash
 
-VOLUME ["/var/syncthing"]
-
-RUN apk add --no-cache ca-certificates curl libcap su-exec tzdata
-
-COPY --from=builder /src/syncthing-linux-$TARGETARCH /bin/syncthing
-COPY --from=builder /src/script/docker-entrypoint.sh /bin/entrypoint.sh
+COPY --from=builder /src/syncthing-linux-amd64 /bin/syncthing
+COPY --from=builder /src/scripts/entrypoint.sh /bin/entrypoint.sh
 
 ENV PUID=1000 PGID=1000 HOME=/var/syncthing
 
